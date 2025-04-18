@@ -1,7 +1,7 @@
 // server/controllers/authController.js
 require('dotenv').config();
-const bcrypt     = require('bcryptjs');
-const jwtSimple  = require('jwt-simple');
+const bcrypt = require('bcryptjs');
+const jwt = require('jwt-simple');
 const nodemailer = require('nodemailer');
 const {
   findUserByEmail,
@@ -10,6 +10,7 @@ const {
   deletePending,
   createUser
 } = require('../models/userModel');
+const { generateToken } = require('../middleware/authMiddleware');
 
 // SMTP transporter for OTP emails
 const transporter = nodemailer.createTransport({
@@ -22,26 +23,51 @@ const transporter = nodemailer.createTransport({
   }
 });
 
+/**
+ * Generate a 6-digit OTP code
+ * @returns {String} 6-digit OTP
+ */
 function generateOTP() {
   return Math.floor(100000 + Math.random() * 900000).toString();
 }
+
+/**
+ * Get expiry time for OTP (5 minutes from now)
+ * @returns {Date} Expiry time
+ */
 function getExpiryTime() {
   const now = new Date();
   now.setMinutes(now.getMinutes() + 5);
   return now;
 }
+
+/**
+ * Get HTML template for OTP email
+ * @param {String} otp - OTP code
+ * @returns {String} HTML email template
+ */
 function getOTPTemplate(otp) {
   return `
-    <h2>Your OTP Code</h2>
-    <p><strong>${otp}</strong> (expires in 5 minutes)</p>
+    <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px; border: 1px solid #e0e0e0; border-radius: 5px;">
+      <h2 style="color: #FF5700; text-align: center;">Your OTP Code</h2>
+      <p style="font-size: 16px; line-height: 1.5;">Please use the following one-time password to complete your registration:</p>
+      <div style="text-align: center; padding: 15px; background-color: #f5f5f5; border-radius: 4px; font-size: 24px; letter-spacing: 5px; font-weight: bold;">
+        ${otp}
+      </div>
+      <p style="font-size: 14px; color: #777; margin-top: 20px;">This code will expire in 5 minutes.</p>
+      <p style="font-size: 14px; color: #777;">If you didn't request this code, please ignore this email.</p>
+    </div>
   `;
 }
 
-// ---- Registration (Step 1): save pending, send OTP ----
+/**
+ * Registration (Step 1): Create pending registration and send OTP
+ * POST /api/auth/register
+ */
 exports.register = (req, res) => {
   try {
     const { name, surname, employeeId, email, role, department, password, confirmPassword } = req.body;
-    console.log('[REGISTER] payload:', req.body);
+    console.log('[REGISTER] payload:', { ...req.body, password: '***', confirmPassword: '***' });
 
     // Validate
     if (!name || !surname || !employeeId || !email || !role || !department || !password || !confirmPassword) {
@@ -72,7 +98,17 @@ exports.register = (req, res) => {
           return res.status(500).json({ message: 'Server error hashing password.' });
         }
 
-        createPending({ name, surname, employeeId, email, role, department, passwordHash, otp, otp_expiry }, (insertErr) => {
+        createPending({ 
+          name, 
+          surname, 
+          employeeId, 
+          email, 
+          role, 
+          department, 
+          passwordHash, 
+          otp, 
+          otp_expiry 
+        }, (insertErr) => {
           if (insertErr) {
             console.error('[REGISTER] DB error on createPending:', insertErr);
             return res.status(500).json({ message: 'Server error saving registration.' });
@@ -100,7 +136,10 @@ exports.register = (req, res) => {
   }
 };
 
-// ---- OTP Verification (Step 2): move pending → NC_Login ----
+/**
+ * OTP Verification (Step 2): Verify OTP and create user
+ * POST /api/auth/verify-otp
+ */
 exports.verifyOtp = (req, res) => {
   try {
     const { email, otp } = req.body;
@@ -155,11 +194,14 @@ exports.verifyOtp = (req, res) => {
   }
 };
 
-// ---- Login: check NC_Login + issue JWT ----
+/**
+ * Login: Authenticate user and issue JWT
+ * POST /api/auth/login
+ */
 exports.login = (req, res) => {
   try {
     const { email, password } = req.body;
-    console.log('[LOGIN] payload:', req.body);
+    console.log('[LOGIN] payload:', { email, password: '***' });
 
     if (!email || !password) {
       return res.status(400).json({ message: 'Email & password required.' });
@@ -185,14 +227,47 @@ exports.login = (req, res) => {
           return res.status(401).json({ message: 'Invalid credentials.' });
         }
 
-        const payload = { userId: user.id, role: user.role };
-        const token   = jwtSimple.encode(payload, process.env.JWT_SECRET);
+        // Generate JWT token
+        const token = generateToken({ id: user.id, role: user.role });
+        
         console.log('[LOGIN] success for:', email);
-        res.json({ token, role: user.role });
+        res.json({ 
+          token, 
+          role: user.role,
+          user: {
+            id: user.id,
+            name: user.name,
+            email: user.email
+          }
+        });
       });
     });
   } catch (ex) {
     console.error('[LOGIN] Unexpected error:', ex);
     res.status(500).json({ message: 'Internal server error.' });
   }
+};
+
+/**
+ * Get current user profile
+ * GET /api/auth/profile
+ */
+exports.getProfile = (req, res) => {
+  const userId = req.user.userId;
+  
+  findUserById(userId, (err, user) => {
+    if (err) {
+      console.error('[PROFILE] DB error:', err);
+      return res.status(500).json({ message: 'Server error fetching profile.' });
+    }
+    
+    if (!user) {
+      return res.status(404).json({ message: 'User not found.' });
+    }
+    
+    // Don't send password
+    delete user.password;
+    
+    res.json(user);
+  });
 };
